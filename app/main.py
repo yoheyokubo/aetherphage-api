@@ -1,172 +1,119 @@
 # app/main.py
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from tempfile import NamedTemporaryFile
+from pathlib import Path
 from typing import List
 
-from fastapi import FastAPI, HTTPException, UploadFile, File
-from pydantic import BaseModel
-
-from app.models.ranker import PhageHostRanker
-from app.utils.fasta import load_single_fasta_sequence
-from app.utils.encoding import encode_sequence
+from app.core.types import GenomeEntity
+from app.utils.sequence import GenomeSource
 from app.utils.dataset import load_host_candidates, load_phage_candidates
+from app.models.ranker import PhageHostRanker
+from app.models.backends import RandomBackend
 
 app = FastAPI(
-    title="Phage-Host Interaction API",
-    description=(
-        "Minimal API for phage–host interaction ranking on the Cherry dataset.\n"
-        "Supports both JSON-based and file-upload-based queries."
-    ),
-    version="0.2.0",
+    title="AetherPhage API",
+    description="Sequence-aware API for phage–host interaction ranking.",
+    version="0.3.0",
 )
 
-# Load model and dataset metadata at startup.
-ranker = PhageHostRanker(model_path=None)  # TODO: set model path when ready
-host_candidates = load_host_candidates()
-phage_candidates = load_phage_candidates()
+# ---------------------------------------------------------------------
+# Load dataset metadata (sequence paths / names / lineage are resolved here)
+# ---------------------------------------------------------------------
 
+host_entities: List[GenomeEntity] = load_host_candidates()
+phage_entities: List[GenomeEntity] = load_phage_candidates()
 
-class PhageQuery(BaseModel):
-    phage_fasta: str
-    top_k: int = 10
+# ---------------------------------------------------------------------
+# Initialize ranker (backend can be swapped later)
+# ---------------------------------------------------------------------
 
-
-class HostQuery(BaseModel):
-    host_fasta: str
-    top_k: int = 10
+ranker = PhageHostRanker(
+    backend=RandomBackend()  # placeholder (CL4PHI / others can be injected)
+)
 
 
 @app.get("/health")
 def health_check():
-    """
-    Lightweight health check endpoint.
-    """
-    return {"status": "ok"}
+    """Lightweight health check endpoint."""
+    return {
+        "status": "ok",
+        "num_hosts": len(host_entities),
+        "num_phages": len(phage_entities),
+        "backend": ranker.backend.name,
+    }
 
 
-# ------------------------------
-# JSON-based endpoints
-# ------------------------------
-
+# ---------------------------------------------------------------------
+# Upload-based endpoints (default)
+# ---------------------------------------------------------------------
 
 @app.post("/predict/phage")
-def predict_hosts(query: PhageQuery):
+async def predict_hosts(
+    file: UploadFile = File(...),
+    top_k: int = 10,
+):
     """
-    (1) Accept a phage genome in FASTA text and rank hosts in the dataset.
+    Upload a single phage FASTA file and rank host candidates.
     """
-    try:
-        seq = load_single_fasta_sequence(query.phage_fasta)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-    if query.top_k <= 0:
+    if top_k <= 0:
         raise HTTPException(status_code=400, detail="top_k must be positive.")
 
-    encoded = encode_sequence(seq)
-    results = ranker.rank_hosts_for_phage(encoded, host_candidates, top_k=query.top_k)
+    with NamedTemporaryFile(delete=False, suffix=".fasta") as tmp:
+        content = await file.read()
+        tmp.write(content)
+        fasta_path = Path(tmp.name)
+
+    query_entity = GenomeEntity(
+        seqs=GenomeSource(path=fasta_path).read()
+    )
+
+    results = ranker.rank(
+        query=query_entity,
+        dataset=host_entities,
+        top_k=top_k,
+        id_key="host_id",
+        name_key="scientific_name",
+    )
 
     return {
         "query_type": "phage_to_host",
-        "top_k": query.top_k,
-        "num_candidates": len(host_candidates),
+        "filename": file.filename,
+        "top_k": top_k,
         "results": results,
     }
 
 
 @app.post("/predict/host")
-def predict_phages(query: HostQuery):
+async def predict_phages(
+    file: UploadFile = File(...),
+    top_k: int = 10,
+):
     """
-    (2) Accept a host genome in FASTA text and rank phages in the dataset.
-    """
-    try:
-        seq = load_single_fasta_sequence(query.host_fasta)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-    if query.top_k <= 0:
-        raise HTTPException(status_code=400, detail="top_k must be positive.")
-
-    encoded = encode_sequence(seq)
-    results = ranker.rank_phages_for_host(encoded, phage_candidates, top_k=query.top_k)
-
-    return {
-        "query_type": "host_to_phage",
-        "top_k": query.top_k,
-        "num_candidates": len(phage_candidates),
-        "results": results,
-    }
-
-
-# ------------------------------
-# File-upload endpoints
-# ------------------------------
-
-
-@app.post("/upload/phage")
-async def upload_phage(file: UploadFile = File(...), top_k: int = 10):
-    """
-    Upload a single phage FASTA file and rank hosts in the dataset.
-
-    This endpoint is convenient for GUI-based usage (e.g., Swagger UI or a web frontend).
+    Upload a single host FASTA file and rank phage candidates.
     """
     if top_k <= 0:
         raise HTTPException(status_code=400, detail="top_k must be positive.")
 
-    if file.content_type not in ("text/plain", "application/octet-stream"):
-        raise HTTPException(status_code=400, detail="Unsupported file type.")
+    with NamedTemporaryFile(delete=False, suffix=".fasta") as tmp:
+        content = await file.read()
+        tmp.write(content)
+        fasta_path = Path(tmp.name)
 
-    raw_bytes = await file.read()
-    try:
-        text = raw_bytes.decode()
-    except UnicodeDecodeError:
-        raise HTTPException(status_code=400, detail="File must be UTF-8 encoded text.")
+    query_entity = GenomeEntity(
+        seqs=GenomeSource(path=fasta_path).read()
+    )
 
-    try:
-        seq = load_single_fasta_sequence(text)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-    encoded = encode_sequence(seq)
-    results = ranker.rank_hosts_for_phage(encoded, host_candidates, top_k=top_k)
-
-    return {
-        "query_type": "phage_to_host",
-        "filename": file.filename,
-        "top_k": top_k,
-        "num_candidates": len(host_candidates),
-        "results": results,
-    }
-
-
-@app.post("/upload/host")
-async def upload_host(file: UploadFile = File(...), top_k: int = 10):
-    """
-    Upload a single host FASTA file and rank phages in the dataset.
-
-    This endpoint is convenient for GUI-based usage (e.g., Swagger UI or a web frontend).
-    """
-    if top_k <= 0:
-        raise HTTPException(status_code=400, detail="top_k must be positive.")
-
-    if file.content_type not in ("text/plain", "application/octet-stream"):
-        raise HTTPException(status_code=400, detail="Unsupported file type.")
-
-    raw_bytes = await file.read()
-    try:
-        text = raw_bytes.decode()
-    except UnicodeDecodeError:
-        raise HTTPException(status_code=400, detail="File must be UTF-8 encoded text.")
-
-    try:
-        seq = load_single_fasta_sequence(text)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-    encoded = encode_sequence(seq)
-    results = ranker.rank_phages_for_host(encoded, phage_candidates, top_k=top_k)
+    results = ranker.rank(
+        query=query_entity,
+        dataset=phage_entities,
+        top_k=top_k,
+        id_key="phage_id",
+        name_key="scientific_name",
+    )
 
     return {
         "query_type": "host_to_phage",
         "filename": file.filename,
         "top_k": top_k,
-        "num_candidates": len(phage_candidates),
         "results": results,
     }
